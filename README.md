@@ -69,15 +69,25 @@ Users can:
 9. Publishing service uploads to YouTube and or TikTok
 10. Notification service updates in-app progress and sends completion alerts
 
-## Suggested Architecture
+## Recommended Architecture
 
-- Frontend: Web dashboard for job creation, progress tracking, and history
-- Backend API: Auth, job management, orchestration endpoints
-- Worker Services: Queue-based pipeline stages for plan, assets, voice, compose, upload
-- Database: Users, jobs, artifacts, progress events, platform connections
-- Object Storage: Generated scripts, media files, audio, video exports
-- WebSocket or SSE: Live progress updates
-- Scheduler and Retry Logic: Recover from transient API failures
+Think of the whole system like a restaurant that takes custom orders (ideas), routes them through several specialized kitchen stations (planning, media, voice, render, publish), and keeps the customer updated on a screen above the counter (progress UI) — while a separate "expo" role makes sure nothing gets lost between stations, even if one station briefly goes down.
+
+- **Frontend** — Next.js (TypeScript), App Router. Handles job creation, live progress, and history browsing. Server Components fetch job history directly from the API for fast initial loads; client components handle the live progress stream.
+- **Backend API** — A dedicated service (NestJS or Fastify on Node.js), separate from the Next.js app, rather than using Next.js API routes for orchestration.
+  - *Why:* Next.js API routes are convenient for CRUD, but a multi-stage async pipeline needs its own lifecycle, scaling, and deploy cadence independent of the frontend. This is the difference between a food truck (one window does everything) and a real kitchen with stations — fine at tiny scale, but you outgrow the food truck fast once orders (jobs) get complex.
+- **Orchestration Engine** — A durable workflow engine (Temporal, or the lighter-weight Inngest) coordinates the pipeline stages, instead of relying on a plain job queue alone.
+  - *Why:* A basic queue (BullMQ) is like a relay race — each worker passes a baton to the next, but if a runner drops it mid-race (a crash, a timeout), nobody automatically knows how to pick up where it left off. A durable workflow engine is more like a conductor with the full score in front of them: it remembers exactly which stage each job was on, retries only the failed step, and survives a crash without losing the job's place. This maps directly to the "resume and retry from failed step" requirement already in this spec.
+  - BullMQ (Redis-backed) still has a place for simple, single-hop background tasks (e.g., sending a notification email) where full durability is overkill.
+- **Worker Services** — Independently deployable, independently scalable workers per stage: planning, media, voice, composition, render, publish.
+  - *Why:* Rendering video is CPU/GPU-heavy; calling an LLM for a script is I/O-bound and cheap. Running them on the same fleet means you either over-provision for render spikes or starve the render stage. Separating them is like keeping the grill station and the salad station on different counters — each can be staffed (scaled) according to its own order volume.
+- **Database** — PostgreSQL, accessed via Prisma (or Drizzle if you want lighter-weight, more SQL-like query control as the schema grows).
+- **Object Storage** — S3-compatible storage for scripts, media, audio, and video exports. Cloudflare R2 is worth evaluating over raw S3 for its zero-egress-fee model, since users will be downloading/streaming finished videos often.
+- **Real-time Updates** — Server-Sent Events (SSE), not WebSockets, for progress streaming.
+  - *Why:* Progress updates only flow one direction — server to client. SSE is a one-way radio broadcast; WebSockets are a two-way walkie-talkie. Since the app never needs to send data back over that same channel, SSE gets the same live-update experience with simpler infrastructure (plain HTTP, no sticky-session load balancing, easy to proxy).
+- **Auth** — Clerk for MVP speed (hosted UI, session handling, social login out of the box), with a documented path to a custom JWT/session layer later if pricing or control becomes a constraint.
+- **Deployment** — Frontend on Vercel; backend API and workers on a container platform with per-service autoscaling (Fly.io, Railway for early stage; AWS ECS/Fargate or GKE once volume justifies it). Each worker type gets its own autoscaling group, so a spike in render jobs doesn't spin up unnecessary planning workers.
+- **Observability** — OpenTelemetry tracing across API → orchestrator → workers, exported to a dashboard (Grafana Cloud or Datadog). This is what actually makes "failure rate per pipeline stage" and "external API latency and quota usage" (both already goals in this spec) measurable rather than aspirational.
 
 ## High-Level Components
 
@@ -90,18 +100,27 @@ Users can:
 - Platform Publishing Integrations
 - Progress Timeline and History UI
 - Notifications and Activity Feed
+- Orchestration and Workflow State (new — the "expo" role that tracks every job across every station)
 
-## Recommended Tech Stack for Web App First
+## Recommended Tech Stack
 
-- Frontend: Next.js with TypeScript
-- Backend: Node.js service layer or Next.js API routes
-- Queue: BullMQ or similar Redis-backed queue
-- Database: PostgreSQL
-- ORM: Prisma
-- Storage: S3-compatible object storage
-- Real-time updates: Server-Sent Events or WebSocket
-- Auth: Clerk, Auth0, or custom JWT plus session strategy
-- Deployment: Vercel for frontend, container platform for workers
+| Layer | Recommendation | Why |
+|---|---|---|
+| Frontend | Next.js + TypeScript | Server Components for fast history/dashboard loads; large ecosystem for auth, forms, streaming UI |
+| Backend API | NestJS (or Fastify) on Node.js | Decoupled from frontend deploys; structured module system suits an orchestration-heavy domain |
+| Orchestration | Temporal (or Inngest for a lighter self-hosted footprint) | Durable, resumable multi-step workflows with built-in retry/backoff — matches the reliability requirements already in this spec |
+| Lightweight queue | BullMQ (Redis) | For simple, single-hop background jobs (emails, cleanup tasks) where full durability isn't needed |
+| Database | PostgreSQL + Prisma | Relational integrity for users/jobs/artifacts/publish records; Prisma keeps schema and migrations in one place |
+| Object Storage | S3-compatible (Cloudflare R2 or AWS S3) | Cheap, durable storage for scripts, media, audio, video; R2 avoids egress fees for frequent downloads |
+| Real-time updates | Server-Sent Events | One-directional progress data doesn't need full-duplex WebSockets; simpler to scale and proxy |
+| Auth | Clerk (or Auth0) | Fast to ship, handles session/token complexity so the team can focus on the pipeline |
+| AI Planning/Script | Anthropic API (Claude) with tool use for structured plan/script output | Structured outputs make it easy to hand a clean script object to the next stage |
+| Media Discovery | Stock APIs (Pexels, Pixabay) + AI image generation fallback (Replicate/fal.ai) when no licensed match is found | Keeps licensing compliant by default, with generative media as a fallback rather than a first resort |
+| Voice Synthesis | ElevenLabs or Play.ht | Mature TTS APIs with multiple voices/languages, fits the "language" constraint already in the idea-submission form |
+| Video Composition/Render | Remotion (React + TypeScript video framework) for template-driven composition, with FFmpeg workers for final encoding/format conversion | Since the whole stack is already React/TypeScript, composing video as code (like writing a webpage that becomes a video) keeps one shared language across frontend and render pipeline, rather than introducing an unrelated video-editing SDK |
+| Publishing | YouTube Data API v3, TikTok Content Posting API | Official upload APIs; OAuth tokens stored encrypted per user |
+| Notifications | SSE (in-app) + Resend or Postmark (email) | Matches the "notify user when each stage completes" requirement without adding a push-notification dependency for MVP |
+| Deployment | Vercel (frontend) + Fly.io/Railway → ECS/Fargate (backend/workers) | Cheap to start, straightforward path to scale each worker type independently |
 
 ## Data Model (Conceptual)
 
@@ -160,6 +179,7 @@ Users can:
 - GET /jobs/:id
 - GET /jobs/:id/steps
 - GET /jobs/:id/artifacts
+- GET /jobs/:id/stream (SSE endpoint for live step/status updates)
 - POST /jobs/:id/retry
 - POST /jobs/:id/publish
 - GET /integrations
@@ -177,7 +197,7 @@ Users can:
 ## Security and Compliance Notes
 
 - Enforce per-user data isolation
-- Encrypt OAuth tokens and sensitive credentials
+- Encrypt OAuth tokens and sensitive credentials (KMS-backed at rest)
 - Apply role-based access if teams are introduced
 - Add content safety filters before publishing
 - Respect platform terms and media licensing requirements
@@ -185,11 +205,11 @@ Users can:
 
 ## Failure Handling and Reliability
 
-- Retry transient failures with exponential backoff
+- Retry transient failures with exponential backoff (native to the orchestration engine's workflow retries)
 - Mark unrecoverable failures with actionable user-facing errors
-- Allow resume and retry from failed step where possible
+- Allow resume and retry from failed step where possible — this is the core reason a durable workflow engine (Temporal/Inngest) is recommended over a plain queue
 - Add idempotency keys for upload and publish operations
-- Track external API latency and quota usage
+- Track external API latency and quota usage via OpenTelemetry traces per stage
 
 ## MVP Scope
 
@@ -222,11 +242,11 @@ Phase 1 should focus on:
 ## Development Roadmap
 
 1. Project setup and auth foundation
-2. Job orchestration and progress event model
+2. Job orchestration and progress event model (stand up Temporal/Inngest + Postgres schema)
 3. AI script generation integration
 4. Media pipeline integration
 5. Voice generation integration
-6. Video composition and rendering pipeline
+6. Video composition and rendering pipeline (Remotion + FFmpeg workers)
 7. YouTube and TikTok publishing integration
 8. Notifications, history UI, and reliability hardening
 
