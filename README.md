@@ -104,23 +104,35 @@ Think of the whole system like a restaurant that takes custom orders (ideas), ro
 
 ## Recommended Tech Stack
 
-| Layer | Recommendation | Why |
-|---|---|---|
-| Frontend | Next.js + TypeScript | Server Components for fast history/dashboard loads; large ecosystem for auth, forms, streaming UI |
-| Backend API | NestJS (or Fastify) on Node.js | Decoupled from frontend deploys; structured module system suits an orchestration-heavy domain |
-| Orchestration | Temporal (or Inngest for a lighter self-hosted footprint) | Durable, resumable multi-step workflows with built-in retry/backoff — matches the reliability requirements already in this spec |
-| Lightweight queue | BullMQ (Redis) | For simple, single-hop background jobs (emails, cleanup tasks) where full durability isn't needed |
-| Database | PostgreSQL + Prisma | Relational integrity for users/jobs/artifacts/publish records; Prisma keeps schema and migrations in one place |
-| Object Storage | S3-compatible (Cloudflare R2 or AWS S3) | Cheap, durable storage for scripts, media, audio, video; R2 avoids egress fees for frequent downloads |
-| Real-time updates | Server-Sent Events | One-directional progress data doesn't need full-duplex WebSockets; simpler to scale and proxy |
-| Auth | Clerk (or Auth0) | Fast to ship, handles session/token complexity so the team can focus on the pipeline |
-| AI Planning/Script | Anthropic API (Claude) with tool use for structured plan/script output | Structured outputs make it easy to hand a clean script object to the next stage |
-| Media Discovery | Stock APIs (Pexels, Pixabay) + AI image generation fallback (Replicate/fal.ai) when no licensed match is found | Keeps licensing compliant by default, with generative media as a fallback rather than a first resort |
-| Voice Synthesis | ElevenLabs or Play.ht | Mature TTS APIs with multiple voices/languages, fits the "language" constraint already in the idea-submission form |
-| Video Composition/Render | Remotion (React + TypeScript video framework) for template-driven composition, with FFmpeg workers for final encoding/format conversion | Since the whole stack is already React/TypeScript, composing video as code (like writing a webpage that becomes a video) keeps one shared language across frontend and render pipeline, rather than introducing an unrelated video-editing SDK |
-| Publishing | YouTube Data API v3, TikTok Content Posting API | Official upload APIs; OAuth tokens stored encrypted per user |
-| Notifications | SSE (in-app) + Resend or Postmark (email) | Matches the "notify user when each stage completes" requirement without adding a push-notification dependency for MVP |
-| Deployment | Vercel (frontend) + Fly.io/Railway → ECS/Fargate (backend/workers) | Cheap to start, straightforward path to scale each worker type independently |
+Every layer below now has two columns: the **Paid** choice (better reliability, less ops work, costs money as usage grows) and a **Free** choice (zero recurring cost, but usually means self-hosting an open-source equivalent on your own compute). See "Deployment Modes" below for how the app switches between them.
+
+| Layer | Paid Recommendation | Free Alternative | Why |
+|---|---|---|---|
+| Frontend | Next.js + TypeScript on Vercel | Same code — Vercel's Hobby tier is already free for small traffic, or self-host on the same free VM as the backend | Server Components for fast history/dashboard loads; large ecosystem for auth, forms, streaming UI |
+| Backend API | NestJS (or Fastify) on Node.js | Same code, self-hosted on a free-tier VM (e.g., Oracle Cloud "Always Free" ARM instance) | Decoupled from frontend deploys; structured module system suits an orchestration-heavy domain |
+| Orchestration | Temporal Cloud | Self-hosted Temporal (open source, run via Docker) — or drop to BullMQ-only if you want zero extra infra and can accept weaker durability guarantees | Durable, resumable multi-step workflows with built-in retry/backoff — matches the reliability requirements already in this spec |
+| Lightweight queue | BullMQ (managed Redis, e.g., Upstash) | BullMQ against a self-hosted Redis container on the same free VM | For simple, single-hop background jobs (emails, cleanup tasks) where full durability isn't needed |
+| Database | Managed PostgreSQL (Neon, Supabase, RDS) | Neon/Supabase free tier, or self-hosted Postgres container on the free VM | Relational integrity for users/jobs/artifacts/publish records |
+| Object Storage | Cloudflare R2 or AWS S3 | Cloudflare R2 free tier (10 GB, no egress fee), or self-hosted MinIO (S3-compatible) on the free VM's disk | Durable storage for scripts, media, audio, video |
+| Real-time updates | Server-Sent Events | Same — SSE has no inherent hosting cost either way | One-directional progress data doesn't need full-duplex WebSockets |
+| Auth | Clerk (or Auth0) | Auth.js (NextAuth) self-hosted against your own database — fully free, no monthly-active-user cap | Fast to ship vs. fully free with more setup work |
+| AI Planning/Script | Anthropic API (Claude), tool use for structured output | Self-hosted open-weight model (Llama 3.1/Mistral via Ollama) on a free VM, or a provider with a free tier for open models (e.g., Groq) | Paid gives stronger reasoning/instruction-following for consistent structured scripts; free trades some quality/latency for zero cost |
+| Media Discovery | Stock APIs (Pexels, Pixabay — already free) + AI image-gen fallback (Replicate/fal.ai) | Stock APIs only (skip the generative fallback), or self-hosted Stable Diffusion (ComfyUI/Automatic1111) if a GPU is available | Keeps licensing compliant by default; free mode just narrows the fallback path |
+| Voice Synthesis | ElevenLabs or Play.ht | Piper TTS or `edge-tts` (both free, open-source or free-to-use, run locally/on the VM) | Paid APIs give more natural, varied voices; free options are solid for MVP narration |
+| Video Composition/Render | Remotion + FFmpeg | Same — Remotion and FFmpeg are open source and free for individuals/small teams (check Remotion's company-size license terms as you grow) | Composing video as code keeps one shared language across frontend and render pipeline either way |
+| Publishing | YouTube Data API v3, TikTok Content Posting API | Same — these are free to call (subject to quota) in both modes | Official upload APIs; OAuth tokens stored encrypted per user |
+| Notifications | SSE (in-app) + Resend or Postmark (email) | SSE (in-app) + Resend free tier (3,000 emails/month) or SMTP through a free-tier email provider | Matches the "notify user when each stage completes" requirement |
+| Deployment | Vercel (frontend) + Fly.io/Railway → ECS/Fargate (backend/workers) | Vercel Hobby tier (frontend) + a single free-tier VM (Oracle Cloud Always Free) running Postgres, Redis, MinIO, self-hosted Temporal, API, and workers via Docker Compose | Paid mode scales each piece independently; free mode consolidates everything onto free compute at the cost of ops effort and a single point of failure |
+| Observability | Grafana Cloud or Datadog | Self-hosted Grafana + Prometheus + Loki via Docker Compose on the same free VM | Same visibility, more setup and maintenance in free mode |
+
+## Deployment Modes: Free vs Paid
+
+The project supports two deployment profiles from day one, so you can build and demo the whole pipeline at zero cost, then flip a switch to move to managed services once real users or reliability requirements show up.
+
+- **Free mode** — every paid dependency above is swapped for a self-hosted, open-source, or free-tier equivalent, consolidated onto a single free-tier VM plus Vercel's free frontend hosting. Trade-off: more manual ops (you're responsible for uptime, backups, and scaling), and a few quality/throughput ceilings (weaker LLM output, single point of failure, no autoscaling).
+- **Paid mode** — the managed-service stack described throughout this document. Trade-off: real recurring cost, but far less operational burden and better reliability/scale out of the box.
+
+Both modes run the **same application code**. Each service the app depends on (LLM, TTS, storage, auth, email, orchestration target) sits behind a small provider interface, so switching modes is a configuration change, not a rewrite. The full provider-abstraction design and a local configuration menu for switching between modes are specified in `architecture.md`.
 
 ## Data Model (Conceptual)
 
@@ -241,8 +253,8 @@ Phase 1 should focus on:
 
 ## Development Roadmap
 
-1. Project setup and auth foundation
-2. Job orchestration and progress event model (stand up Temporal/Inngest + Postgres schema)
+1. Project setup and auth foundation, including the local configuration menu (`npm run configure`) for choosing Free vs Paid deployment mode
+2. Job orchestration and progress event model (stand up Temporal/Inngest + Postgres schema, wired through the provider abstraction so it works against either self-hosted or managed backends)
 3. AI script generation integration
 4. Media pipeline integration
 5. Voice generation integration

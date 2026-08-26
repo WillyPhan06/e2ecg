@@ -293,7 +293,97 @@ Workers publish to a Redis pub/sub channel keyed by `job:{jobId}:events`. The AP
 
 This same event is also durably written to `job_steps`, so a user who refreshes mid-job (missing live events) gets the same picture from a plain `GET /jobs/:id/steps` call — SSE is a convenience layer, not the source of truth.
 
-## 10. Deployment Topology
+## 10. Deployment Modes: Provider Abstraction and Local Configuration Menu
+
+Every external dependency in this system — LLM, TTS, storage, auth, email, orchestration backend — is accessed through a small interface rather than being called directly. This is what makes it possible to run the entire pipeline on either **free, self-hosted services** or **paid, managed services** without touching business logic. Think of each provider interface as a standard wall socket: the workflow code just plugs in, and it doesn't care whether the electricity behind the wall comes from the grid (paid, managed) or a generator you're running yourself (free, self-hosted) — as long as the plug shape matches.
+
+### 10.1 Provider Interfaces
+
+```typescript
+interface LLMProvider {
+  generatePlan(input: JobInput): Promise<ContentPlan>;
+  draftScript(plan: ContentPlan): Promise<Script>;
+}
+
+interface TTSProvider {
+  synthesize(script: Script, language: string): Promise<AudioAsset>;
+}
+
+interface ImageGenProvider {
+  generate(prompt: string): Promise<ImageAsset>;
+}
+
+interface StorageProvider {
+  putObject(key: string, data: Buffer): Promise<string>;
+  getSignedUrl(key: string, expirySeconds: number): Promise<string>;
+}
+
+interface AuthProvider {
+  verifySession(token: string): Promise<{ userId: string }>;
+}
+
+interface EmailProvider {
+  send(to: string, subject: string, body: string): Promise<void>;
+}
+```
+
+### 10.2 Implementations Per Mode
+
+| Interface | Paid Implementation | Free Implementation |
+|---|---|---|
+| `LLMProvider` | `AnthropicLLMProvider` (Claude via Anthropic API) | `OllamaLLMProvider` (self-hosted Llama 3.1/Mistral) or `GroqLLMProvider` (free tier, open models) |
+| `TTSProvider` | `ElevenLabsProvider` | `PiperTTSProvider` or `EdgeTTSProvider` |
+| `ImageGenProvider` | `ReplicateImageProvider` | `StableDiffusionLocalProvider` (ComfyUI on the free VM) or disabled — stock-only fallback |
+| `StorageProvider` | `S3StorageProvider` (AWS S3 / Cloudflare R2) | `MinioStorageProvider` (self-hosted, S3-compatible API, same interface) |
+| `AuthProvider` | `ClerkAuthProvider` | `AuthJsProvider` (self-hosted NextAuth/Auth.js against Postgres) |
+| `EmailProvider` | `ResendEmailProvider` | `SmtpEmailProvider` (free-tier SMTP relay) |
+| Orchestration target | Temporal Cloud connection | Self-hosted Temporal server (Docker) — same Temporal SDK, different `TEMPORAL_ADDRESS` |
+
+A factory resolves the correct implementation at startup, based on a single environment variable:
+
+```typescript
+export function getLLMProvider(): LLMProvider {
+  return process.env.DEPLOYMENT_MODE === 'free'
+    ? new OllamaLLMProvider(process.env.OLLAMA_HOST)
+    : new AnthropicLLMProvider(process.env.ANTHROPIC_API_KEY);
+}
+```
+
+Every provider follows this same pattern, so `DEPLOYMENT_MODE` is the single source of truth for which services the whole app talks to. Activities and API modules depend only on the interfaces (`LLMProvider`, `StorageProvider`, etc.), never on a concrete class — standard dependency inversion, which is what keeps this swap from leaking into workflow or business logic.
+
+### 10.3 Local Configuration Menu
+
+A setup script, `scripts/configure.ts`, run via `npm run configure`, gives the developer an interactive menu instead of hand-editing environment files:
+
+```
+$ npm run configure
+
+e2ecg setup
+? Choose a deployment mode:
+  ❯ Free   — self-hosted, zero recurring cost, more manual ops
+    Paid   — managed services, less ops, costs scale with usage
+
+? Free mode selected. Where will this run?
+  ❯ Single local/free-tier VM (Docker Compose)
+    Local development machine only
+
+Writing .env.local ...
+Writing docker-compose.free.yml service selection ...
+
+Done. Next steps:
+  docker compose -f docker-compose.free.yml up -d
+  npm run dev
+```
+
+Behavior:
+- Selecting **Free** writes `DEPLOYMENT_MODE=free` plus the free-mode connection settings (`OLLAMA_HOST`, `MINIO_ENDPOINT`, local Postgres/Redis URLs, self-hosted Temporal address) to `.env.local`, and points the developer at `docker-compose.free.yml`, which stands up Postgres, Redis, MinIO, a self-hosted Temporal server, and Grafana/Prometheus/Loki as containers alongside the API and workers.
+- Selecting **Paid** writes `DEPLOYMENT_MODE=paid` and prompts for the managed-service credentials it needs (Anthropic API key, ElevenLabs key, Clerk keys, S3/R2 credentials, Temporal Cloud namespace, Resend key), validating each key with a lightweight ping call before saving.
+- The menu can be re-run at any time; it never deletes existing `.env.local` values it doesn't need to change, so a developer can also hand-mix providers (e.g., paid LLM with free storage) by editing `.env.local` after running the menu once.
+- The same `DEPLOYMENT_MODE` variable is read by the Docker Compose files, the Next.js app, the API, and every worker, so there is exactly one switch to flip.
+
+## 11. Deployment Topology
+
+### 11.1 Paid Mode
 
 ```mermaid
 graph TB
@@ -329,23 +419,58 @@ graph TB
 - **Postgres**: managed (RDS, Neon, or Supabase) with automated backups; add a read replica once history/search queries start competing with write-heavy job traffic.
 - **Redis**: managed instance, used only for pub/sub and any lightweight BullMQ queues (e.g., outbound email) — not for durable job state.
 
-## 11. Security Architecture
+### 11.2 Free Mode
 
-- All inter-service calls over TLS; API validates Clerk session JWTs on every request.
-- OAuth tokens for YouTube/TikTok encrypted at rest using envelope encryption (KMS-managed data key per token); decrypted only inside the publish worker's process memory, never logged.
+```mermaid
+graph TB
+    subgraph "Vercel Hobby (free)"
+        FE[Next.js Frontend]
+    end
+    subgraph "Single Free-Tier VM - Docker Compose"
+        API[API container]
+        TW[Temporal Workers - all queues, same host]
+        TS[Self-hosted Temporal server]
+        PG[(Postgres container)]
+        RD[(Redis container)]
+        MO[(MinIO container)]
+        OB[Grafana + Prometheus + Loki]
+    end
+    FE --> API
+    API --> PG
+    API --> RD
+    API --> TS
+    TW --> TS
+    TW --> PG
+    TW --> MO
+    TW --> RD
+    API -.metrics.-> OB
+    TW -.metrics.-> OB
+```
+
+Everything except the frontend runs on a single free-tier VM (e.g., an Oracle Cloud "Always Free" ARM instance) as Docker Compose services, defined in `docker-compose.free.yml` (see §10.3). This is deliberately a monolithic topology — no autoscaling, one host is a single point of failure — but it costs nothing to run and is enough to develop and demo the full pipeline end-to-end.
+
+- All Temporal workers run as containers on the same host, competing for the same CPU. Fine for low job volume; the render stage is the first thing that will bottleneck as usage grows.
+- Because every service sits behind the provider interfaces from §10.1, moving from this topology to the paid topology in §11.1 is a `DEPLOYMENT_MODE` flip plus a data migration (Postgres dump/restore, MinIO → S3/R2 object copy) — not a rewrite.
+
+## 12. Security Architecture
+
+- All inter-service calls over TLS; API validates session tokens on every request via the active `AuthProvider` (Clerk in paid mode, self-hosted Auth.js in free mode).
+- OAuth tokens for YouTube/TikTok encrypted at rest using envelope encryption (KMS-managed data key in paid mode; a locally-managed symmetric key in free mode, since there's no managed KMS on a bare VM) — decrypted only inside the publish worker's process memory, never logged.
 - Per-user row-level isolation enforced at the query layer (every `jobs`/`artifacts` query scoped by `user_id` derived from the authenticated session, not from client input).
-- Signed, short-TTL URLs for all storage reads/writes — no long-lived public buckets.
-- Content safety filter (moderation API call) runs as an activity between `composeTimeline` and `publishContent`, so generated content is checked before it ever reaches a platform's public API.
+- Signed, short-TTL URLs for all storage reads/writes — no long-lived public buckets, whether the backing store is S3/R2 or self-hosted MinIO.
+- Content safety filter (moderation API call, or a self-hosted moderation model in free mode) runs as an activity between `composeTimeline` and `publishContent`, so generated content is checked before it ever reaches a platform's public API.
 
-## 12. Observability
+## 13. Observability
 
-- **Tracing**: OpenTelemetry spans across API → Temporal workflow → activities, exported to Grafana Cloud or Datadog. A single trace should let you click from "job took 4 minutes" down to "the render activity took 3 of those minutes."
-- **Metrics**: per-stage duration histograms, per-stage failure rate, external API latency (Anthropic, TTS, stock media, YouTube, TikTok) and quota/rate-limit consumption — feeds directly into the README's "failure rate per pipeline stage" and "publish success rate by platform" success metrics.
+- **Tracing**: OpenTelemetry spans across API → Temporal workflow → activities. Paid mode exports to Grafana Cloud or Datadog; free mode exports to a self-hosted Grafana + Prometheus + Loki stack running as containers on the same free VM. Either way, a single trace should let you click from "job took 4 minutes" down to "the render activity took 3 of those minutes."
+- **Metrics**: per-stage duration histograms, per-stage failure rate, external/local provider latency (LLM, TTS, stock media, YouTube, TikTok) and quota/rate-limit consumption — feeds directly into the README's "failure rate per pipeline stage" and "publish success rate by platform" success metrics.
 - **Logging**: structured JSON logs from every worker, correlated by `jobId` and Temporal `workflowId`/`runId`.
-- **Alerting**: threshold alerts on stage failure rate and on queue depth per task queue (a growing `render` queue with flat worker count is the first sign you need to scale that pool).
+- **Alerting**: threshold alerts on stage failure rate and on queue depth per task queue (a growing `render` queue with flat worker count is the first sign you need to scale that pool — in free mode, it's a sign you've outgrown a single VM).
 
-## 13. Open Questions / Decisions to Revisit
+## 14. Open Questions / Decisions to Revisit
 
 - Self-hosted Temporal vs Temporal Cloud — revisit once volume or cost projections are clearer.
 - Whether composition (Remotion timeline assembly) and rendering should be one activity or two — currently split so a composition bug doesn't waste an expensive render, but this adds a hop; worth revisiting after real timing data exists.
 - GPU-accelerated encoding for render workers — evaluate once render duration/cost becomes a bottleneck; not needed for MVP volumes.
+- Free-mode LLM quality — self-hosted open-weight models will likely need more prompt tuning than Claude to reliably produce well-structured scripts; worth budgeting extra iteration time if free mode is the primary target rather than just a dev/demo path.
+- Free-mode single point of failure — acceptable for MVP/demo use; revisit before onboarding real users on free mode, since there's no redundancy if the VM goes down.
