@@ -1,6 +1,6 @@
 # e2ecg — Development To-Do
 
-Derived from `README.md` and `architecture.md`. Phases are ordered so each one produces something runnable before the next begins — like building a house from foundation to roof rather than framing every room at once. Every phase should end in a demoable state, even if the demo is rough.
+Derived from `README.md` and `ARCHITECTURE.md`. Phases are ordered so each one produces something runnable before the next begins — like building a house from foundation to roof rather than framing every room at once. Every phase should end in a demoable state, even if the demo is rough.
 
 Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
@@ -12,8 +12,8 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 - [ ] Initialize monorepo (pnpm workspaces or Turborepo): `apps/frontend`, `apps/api`, `apps/workers`, `packages/shared`
 - [ ] Set up shared TypeScript config, ESLint, Prettier across packages
-- [ ] Define the full environment variable schema (`.env.example`) covering both `DEPLOYMENT_MODE=free` and `DEPLOYMENT_MODE=paid` variables (architecture.md §10.2)
-- [ ] Build `scripts/configure.ts` — the interactive local configuration menu (architecture.md §10.3)
+- [ ] Define the full environment variable schema (`.env.example`) covering both `DEPLOYMENT_MODE=free` and `DEPLOYMENT_MODE=paid` variables (ARCHITECTURE.md §10.2)
+- [ ] Build `scripts/configure.ts` — the interactive local configuration menu (ARCHITECTURE.md §10.3)
   - [ ] Free/Paid mode prompt
   - [ ] Writes `.env.local` with mode-appropriate variables
   - [ ] Paid mode: prompts for and lightly validates each managed-service API key
@@ -30,12 +30,12 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 *Before anything can be a "job," the app needs to know who's asking and somewhere durable to write things down.*
 
-- [ ] Define `AuthProvider` interface (architecture.md §10.1)
+- [ ] Define `AuthProvider` interface (ARCHITECTURE.md §10.1)
 - [ ] Implement `ClerkAuthProvider` (paid mode)
 - [ ] Implement `AuthJsProvider` self-hosted against Postgres (free mode)
 - [ ] Provider factory wired to `DEPLOYMENT_MODE`
-- [ ] Postgres schema + Prisma migrations for: `users`, `jobs`, `job_steps`, `artifacts`, `platform_accounts`, `publish_records` (architecture.md §5)
-- [ ] Add indexes: `jobs(user_id, created_at desc)`, `job_steps(job_id)`, `artifacts(job_id)`
+- [ ] Postgres schema + Prisma migrations for: `users`, `jobs`, `job_steps`, `script_versions`, `claims`, `evidence_sources`, `claim_reviews`, `artifacts`, `platform_accounts`, `publish_records` (ARCHITECTURE.md §5)
+- [ ] Add indexes: `jobs(user_id, created_at desc)`, `job_steps(job_id)`, `claims(job_id, script_version_id)`, `evidence_sources(claim_id)`, `claim_reviews(claim_id, created_at desc)`, `artifacts(job_id)`
 - [ ] Next.js app shell: layout, navigation, auth-aware routing (`/dashboard`, `/jobs/new`, `/jobs/[id]`, `/settings/integrations`)
 - [ ] Registration/login flow wired to the active `AuthProvider`
 - [ ] API middleware: attach `userId` from verified session to every request context
@@ -50,15 +50,16 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 *This is the expo station going up before any food is cooked — the workflow engine and job bookkeeping need to exist before planning, media, or voice logic has anywhere to report to.*
 
 - [ ] Stand up Temporal: self-hosted server via Docker (free) and Temporal Cloud namespace (paid)
-- [ ] Define `VideoGenerationWorkflow` skeleton with stubbed activities (architecture.md §3.3)
-- [ ] Define one Temporal task queue per stage: `e2ecg-planning`, `e2ecg-media`, `e2ecg-voice`, `e2ecg-composition`, `e2ecg-render`, `e2ecg-publish`
+- [ ] Define `VideoGenerationWorkflow` skeleton with stubbed activities (ARCHITECTURE.md §3.3)
+- [ ] Define Temporal task queues for planning, fact-checking, media, voice, composition, render, and publish: `e2ecg-planning`, `e2ecg-fact-checking`, `e2ecg-media`, `e2ecg-voice`, `e2ecg-composition`, `e2ecg-render`, `e2ecg-publish`
 - [ ] `JobsModule`: `POST /jobs` (validate input, insert `Job` row, start workflow with id `job:{jobId}`)
 - [ ] `GET /jobs`, `GET /jobs/:id`, `GET /jobs/:id/steps`
 - [ ] `recordStep()` helper: writes `job_steps` row + publishes Redis pub/sub event on every activity start/finish
-- [ ] `StreamModule`: `GET /jobs/:id/stream` SSE endpoint relaying pub/sub events (architecture.md §9)
+- [ ] `StreamModule`: `GET /jobs/:id/stream` SSE endpoint relaying step and fact-check events (ARCHITECTURE.md §9)
 - [ ] Frontend: idea submission form (`/jobs/new`) matching the README's Submit Idea fields (idea, audience, tone, platforms, constraints)
 - [ ] Frontend: live progress view (`/jobs/[id]`) subscribed to the SSE stream, with fallback to `GET /jobs/:id/steps` on reconnect
 - [ ] Idempotency check: re-submitting the same job id returns the existing workflow handle, not a duplicate run
+- [ ] Add workflow states for `claim_extraction`, `evidence_retrieval`, `claim_assessment`, `review_required`, and the approved-production path
 
 **Exit criteria:** submitting an idea creates a job that visibly walks through stubbed stages in the UI in real time, end to end, with no real AI calls yet.
 
@@ -68,14 +69,14 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 *The first real "station" comes online: turning a one-line idea into a structured script an entire pipeline can build on.*
 
-- [ ] Define `LLMProvider` interface (architecture.md §10.1)
+- [ ] Define `LLMProvider` interface (ARCHITECTURE.md §10.1)
 - [ ] Implement `AnthropicLLMProvider` using tool use for structured plan/script output
 - [ ] Implement `OllamaLLMProvider` (self-hosted Llama 3.1/Mistral) and/or `GroqLLMProvider` (free tier, open models)
 - [ ] Design prompt templates that incorporate audience, tone, duration, CTA, and language constraints
 - [ ] Implement `planContent` activity
 - [ ] Implement `draftScript` activity
 - [ ] Validate LLM output against a typed `Script` schema; retry-with-repair on malformed output
-- [ ] Persist `script.json` as an `Artifact` via `StorageProvider`
+- [ ] Persist each script as a `script_versions` row and persist `script.json` as an `Artifact` via `StorageProvider`
 - [ ] Unit tests: prompt → schema-valid output for both providers
 - [ ] Frontend: display plan/script artifact in the job detail view once available
 
@@ -83,18 +84,44 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ---
 
-## Phase 4 — Media & Voice Pipeline
+## Phase 4 — Claim-Level Fact-Checking
 
-*Two stations that don't depend on each other — casting (media) and narration (voice) — built to run in parallel once the script exists, per the workflow design in architecture.md §3.3.*
+*The core differentiator: every draft script is decomposed into checkable claims, assessed against retrieved evidence, and gated before production continues.*
+
+- [ ] Define typed contracts for `ExtractedClaim`, `EvidenceSource`, `ClaimAssessment`, review decisions, and the four outcomes: `supported`, `contradicted`, `unsupported`, `insufficient_or_conflicting`
+- [ ] Define `EvidenceProvider` interface and provider configuration/allowlist rules (ARCHITECTURE.md §10.1)
+- [ ] Implement `extractClaims` activity: identify explicit checkable factual statements and preserve paragraph, sentence, and segment locations
+- [ ] Implement `EvidenceProvider` adapter for a limited, documented set of search/source providers
+- [ ] Implement `retrieveEvidence` activity: store source URL, title, publisher, publication/retrieval dates, permitted excerpts, direction, quality notes, and content hash
+- [ ] Implement `assessClaims` activity: evaluate claims only against supplied evidence and return a structured outcome plus concise rationale
+- [ ] Distinguish `unsupported` from `contradicted`; never treat missing evidence as proof that a claim is false
+- [ ] Record provider/model versions, retrieval timestamps, failures, and uncertainty metadata for auditability
+- [ ] Treat retrieval/provider failures as incomplete checks; retry transient failures and never silently bypass the review gate
+- [ ] Implement `applyReviewGate`: allow supported claims according to policy and route flagged, ambiguous, or incomplete claims to revision or human review
+- [ ] Add `ClaimsModule` endpoints: list claims, get claim details, list evidence, submit review decisions, and request recheck
+- [ ] Enforce per-user authorization for claims, evidence, script versions, and review decisions
+- [ ] Build claim-level review UI showing claim text, script location, sources, excerpts, rationale, limitations, outcome, and next action
+- [ ] Implement accept/revise/remove/request-review decisions with immutable audit records
+- [ ] Implement script revision and recheck: create a new `script_versions` row and new claim/evidence assessments without overwriting prior results
+- [ ] Emit and persist fact-check progress, claim counts, flagged counts, and `review_required` transitions through SSE and job history
+- [ ] Add focused tests for extraction coverage, evidence relevance, outcome classification, uncertainty/conflict handling, gate behavior, and recheck consistency
+
+**Exit criteria:** a draft script produces inspectable claims and evidence, flagged or incomplete checks stop production, and a revised/approved script can be reassessed before continuing.
+
+---
+
+## Phase 5 — Media & Voice Pipeline
+
+*Two stations that don't depend on each other — casting (media) and narration (voice) — built to run in parallel once the approved script exists, per the workflow design in ARCHITECTURE.md §3.3.*
 
 - [ ] Integrate stock media APIs (Pexels, Pixabay) for licensed asset search
-- [ ] Define `ImageGenProvider` interface
+- [ ] Define `ImageGenProvider` interface (ARCHITECTURE.md §10.1)
 - [ ] Implement `ReplicateImageProvider` (paid fallback) and `StableDiffusionLocalProvider`/disabled stock-only path (free mode)
 - [ ] Implement `collectMedia` activity: stock search first, generative fallback only on no-match, tagged with provenance metadata
 - [ ] Define `TTSProvider` interface
 - [ ] Implement `ElevenLabsProvider`/`PlayHtProvider` (paid) and `PiperTTSProvider`/`EdgeTTSProvider` (free)
 - [ ] Implement `generateVoice` activity, respecting the `language` constraint from job input
-- [ ] Confirm workflow runs `collectMedia` and `generateVoice` concurrently (`Promise.all` per architecture.md §3.3)
+- [ ] Confirm workflow runs `collectMedia` and `generateVoice` concurrently only after the review gate approves the script (`Promise.all` per ARCHITECTURE.md §3.3)
 - [ ] Persist media and voice artifacts with metadata (duration, resolution, provider used)
 - [ ] Frontend: show media thumbnails and an audio player in the job detail view as they land
 
@@ -102,32 +129,32 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ---
 
-## Phase 5 — Composition & Rendering
+## Phase 6 — Composition & Rendering
 
-*The most resource-hungry station in the whole line — isolated on its own queue precisely so a render spike doesn't starve everything upstream of it (README/architecture rationale for per-stage worker pools).*
+*The most resource-hungry station in the whole line — isolated on its own queue precisely so a render spike doesn't starve everything upstream of it (README and ARCHITECTURE.md rationale for per-stage worker pools).*
 
 - [ ] Set up Remotion project for code-driven timeline composition
 - [ ] Implement `composeTimeline` activity: assembles captions, transitions, audio sync into a render spec
 - [ ] Implement `renderVideo` activity: Remotion render + FFmpeg encode to platform-ready formats
 - [ ] Deploy render workers on their own autoscaling group/queue, separate from lighter stages
 - [ ] Add captions export (`.srt`) alongside the final video
-- [ ] Store `final.mp4` and captions in the `render/` storage path (architecture.md §8)
-- [ ] Load-test render duration/cost to inform the GPU-encoding decision flagged in architecture.md §14
+- [ ] Store `final.mp4` and captions in the `render/` storage path (ARCHITECTURE.md §8)
+- [ ] Load-test render duration/cost to inform the GPU-encoding decision flagged in ARCHITECTURE.md §12
 - [ ] Frontend: video preview player in the job detail view once rendering completes
 
 **Exit criteria:** a job produces a finished, watchable, platform-formatted video with captions, end to end.
 
 ---
 
-## Phase 6 — Publishing Integrations
+## Phase 7 — Publishing Integrations
 
 *The pipeline finally leaves the building: the last hand-off before content is live on someone else's platform, so idempotency here matters more than anywhere else.*
 
 - [ ] `IntegrationsModule`: YouTube OAuth connect/disconnect flow
 - [ ] `IntegrationsModule`: TikTok OAuth connect/disconnect flow
-- [ ] Encrypt OAuth tokens at rest (KMS envelope encryption in paid mode; locally-managed key in free mode — architecture.md §12)
+- [ ] Encrypt OAuth tokens at rest (KMS envelope encryption in paid mode; locally-managed key in free mode — ARCHITECTURE.md §12)
 - [ ] Implement content safety filter activity between `composeTimeline` and `publishContent`
-- [ ] Implement `publishContent` activity with a deterministic `idempotency_key` per `(jobId, provider)` (architecture.md §7)
+- [ ] Implement `publishContent` activity with a deterministic `idempotency_key` per `(jobId, provider)` (ARCHITECTURE.md §7)
 - [ ] `POST /jobs/:id/publish` endpoint (per-provider selection)
 - [ ] Insert `publish_records` row with remote content id/URL on success
 - [ ] Handle and surface provider-specific upload errors distinctly from pipeline errors
@@ -135,9 +162,9 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 **Exit criteria:** a finished video can be published to a connected YouTube and/or TikTok account, with a retried publish never creating a duplicate upload.
 
----
+---  
 
-## Phase 7 — Notifications, History & Retry UX
+## Phase 8 — Notifications, History & Retry UX
 
 *Closing the loop back to the user — the parts of the README's "human-visible checkpoints" goal that don't live inside the pipeline itself.*
 
@@ -147,7 +174,7 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - [ ] Build job history dashboard: list, filter, search (README "Review Output and History")
 - [ ] Job detail page: full artifact viewer (script, media, voice, video), timestamps, publish links
 - [ ] Implement re-run and duplicate-job actions
-- [ ] `POST /jobs/:id/retry`: signal the existing workflow to retry from the failed activity, preserving completed artifacts (architecture.md §6)
+- [ ] `POST /jobs/:id/retry`: signal the existing workflow to retry from the failed activity, preserving completed artifacts (ARCHITECTURE.md §6)
 - [ ] Tune per-activity retry policies (initial interval, backoff coefficient, max attempts) — aggressive for LLM 429s, conservative for publish rate limits
 - [ ] Surface clear, actionable failure reasons in the UI (not raw stack traces)
 
@@ -155,7 +182,7 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 
 ---
 
-## Phase 8 — Observability & Reliability Hardening
+## Phase 9 — Observability & Reliability Hardening
 
 *Instrumentation that turns "it feels slow sometimes" into an actual number you can act on — this is what makes the README's success metrics real rather than aspirational.*
 
@@ -166,22 +193,22 @@ Checkbox legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - [ ] Alerting: stage failure-rate threshold, queue-depth-per-task-queue threshold
 - [ ] Structured JSON logging correlated by `jobId` and Temporal `workflowId`/`runId`
 - [ ] Chaos test: kill a worker mid-render, confirm Temporal reschedules and the job resumes without data loss
-- [ ] Basic load test to find the free-mode single-VM ceiling (§14 in architecture.md)
+- [ ] Basic load test to find the free-mode single-VM ceiling (ARCHITECTURE.md §12)
 
 **Exit criteria:** you can answer "what's our failure rate on the render stage this week" and "did that retry actually pick up where it left off" from dashboards, not guesswork.
 
 ---
 
-## Phase 9 — Deployment & Launch Readiness
+## Phase 10 — Deployment & Launch Readiness
 
 *Standing up both houses for real — the free-tier VM and the managed-services stack — and proving the migration path between them actually works.*
 
 - [ ] Paid mode: deploy frontend to Vercel; API + workers to Fly.io/Railway (or ECS/Fargate); connect Temporal Cloud, managed Postgres, Redis, S3/R2
 - [ ] Free mode: provision an Oracle Cloud "Always Free" VM, deploy full `docker-compose.free.yml` stack
-- [ ] Dry-run the Free → Paid migration path: Postgres dump/restore, MinIO → S3/R2 object copy, `DEPLOYMENT_MODE` flip (architecture.md §11.2)
+- [ ] Dry-run the Free → Paid migration path: Postgres dump/restore, MinIO → S3/R2 object copy, `DEPLOYMENT_MODE` flip (ARCHITECTURE.md §11.2)
 - [ ] Security review pass: token encryption, signed URL expiry, per-user isolation audit, content safety filter coverage
 - [ ] Acceptance test against the README's MVP Scope checklist end to end, in both modes
-- [ ] Write user-facing setup docs referencing `README.md` and `architecture.md`
+- [ ] Write user-facing setup docs referencing `README.md` and `ARCHITECTURE.md`
 
 **Exit criteria:** the MVP scope from the README works, unassisted, in both Free and Paid mode, and switching modes is a documented, tested procedure rather than a leap of faith.
 

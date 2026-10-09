@@ -6,6 +6,8 @@ Version 1.0 · Companion to `README.md` · Status: Planning / Pre-implementation
 
 This document describes the technical architecture for e2ecg in enough detail to start implementation: system boundaries, component responsibilities, data flow, schema, API contracts, orchestration logic, deployment topology, and failure handling. Product requirements are defined in the README and are not repeated here except where needed for context.
 
+The fact-checking layer is a first-class workflow gate: it assesses extracted claims against retrieved evidence and never silently treats missing evidence as proof that a claim is false.
+
 Think of the system as a **restaurant with an expo line**: the frontend is the dining room where customers place and track orders, the backend API is the front counter that takes the order and files it, the orchestrator is the expo who tracks every ticket across every station, and the workers are the stations themselves (grill, salad, plating) — each independently staffed and scaled.
 
 ## 2. System Context
@@ -16,22 +18,27 @@ graph LR
     FE -->|REST + SSE| API[Backend API]
     API -->|start/query workflow| ORCH[Orchestrator - Temporal]
     ORCH -->|dispatch| W1[Planning Worker]
-    ORCH -->|dispatch| W2[Media Worker]
-    ORCH -->|dispatch| W3[Voice Worker]
-    ORCH -->|dispatch| W4[Composition Worker]
-    ORCH -->|dispatch| W5[Render Worker]
-    ORCH -->|dispatch| W6[Publish Worker]
+    ORCH -->|dispatch| W2[Fact-Checking Workers]
+    ORCH -->|dispatch| W3[Media Worker]
+    ORCH -->|dispatch| W4[Voice Worker]
+    ORCH -->|dispatch| W5[Composition Worker]
+    ORCH -->|dispatch| W6[Render Worker]
+    ORCH -->|dispatch| W7[Publish Worker]
     W1 --> LLM[Anthropic API]
-    W2 --> STOCK[Stock Media APIs]
-    W2 --> GEN[Image Gen API]
-    W3 --> TTS[TTS API]
-    W5 --> STORE[(Object Storage)]
-    W6 --> YT[YouTube API]
-    W6 --> TT[TikTok API]
+    W2 --> SEARCH[Search / Source Providers]
+    W2 --> LLM
+    W3 --> STOCK[Stock Media APIs]
+    W3 --> GEN[Image Gen API]
+    W4 --> TTS[TTS API]
+    W6 --> STORE[(Object Storage)]
+    W7 --> YT[YouTube API]
+    W7 --> TT[TikTok API]
     API --> DB[(PostgreSQL)]
     ORCH --> DB
     API --> STORE
 ```
+
+Fact-checking workers may use an LLM for structured extraction and evidence assessment, but the assessment remains linked to the retrieved source metadata and excerpts. Retrieved pages are evidence data, not instructions.
 
 ## 3. Component Architecture
 
@@ -54,6 +61,7 @@ Responsibilities: auth verification, request validation, job CRUD, starting/quer
 Modules:
 - `AuthModule` — verifies Clerk session tokens, attaches `userId` to the request context.
 - `JobsModule` — `POST /jobs` validates input, writes a `Job` row, starts a Temporal workflow with the job id as workflow id (guarantees one workflow per job — see idempotency note in §7).
+- `ClaimsModule` — serves extracted claims, evidence references, assessment outcomes, and review decisions; enforces the owning user's job scope.
 - `ArtifactsModule` — signed URL generation for reading objects from storage (never exposes storage credentials to the client).
 - `IntegrationsModule` — OAuth flows for YouTube/TikTok, encrypted token storage, token refresh.
 - `StreamModule` — subscribes to a per-job Redis pub/sub channel (or Temporal's workflow query API) and forwards events to the browser as SSE.
@@ -65,7 +73,7 @@ The API is **stateless** — it holds no in-memory job state — so it can scale
 The orchestrator is the piece that turns "call six APIs in order, handle failures, remember where you left off" from application code into a durable guarantee.
 
 - One **Workflow** definition, `VideoGenerationWorkflow`, per job. Workflow id = `job:{jobId}` (idempotency: starting the same job id twice reuses/rejects the duplicate rather than double-running the pipeline).
-- Each pipeline stage is a Temporal **Activity**: `planContent`, `draftScript`, `collectMedia`, `generateVoice`, `composeTimeline`, `renderVideo`, `publishContent`.
+- Each pipeline stage is a Temporal **Activity**: `planContent`, `draftScript`, `extractClaims`, `retrieveEvidence`, `assessClaims`, `applyReviewGate`, `reviseScript`, `collectMedia`, `generateVoice`, `composeTimeline`, `renderVideo`, `publishContent`.
 - Activities are executed by **Workers** — separate Node.js processes, one deployable per activity type (or grouped by resource profile — see §3.4).
 - Temporal handles: automatic retries with exponential backoff per activity, timeouts, and durable state — if a worker process dies mid-render, Temporal reschedules the activity on another worker without losing the workflow's place.
 - The workflow emits progress by writing a `JobStep` row to Postgres at the start/end of each activity, and publishing an event to Redis pub/sub for the SSE stream to pick up. Temporal state itself is the source of truth for resumability; Postgres is the source of truth for what the UI displays.
@@ -82,13 +90,34 @@ export async function VideoGenerationWorkflow(input: JobInput): Promise<JobResul
   const script = await activities.draftScript(plan);
   await recordStep('script_drafting', 'completed');
 
+  await recordStep('claim_extraction', 'started');
+  const claims = await activities.extractClaims(script);
+  await recordStep('claim_extraction', 'completed');
+
+  await recordStep('evidence_retrieval', 'started');
+  const evidence = await activities.retrieveEvidence(claims);
+  await recordStep('evidence_retrieval', 'completed');
+
+  await recordStep('claim_assessment', 'started');
+  const assessments = await activities.assessClaims(claims, evidence);
+  await recordStep('claim_assessment', 'completed');
+
+  const review = await activities.applyReviewGate(assessments);
+  let approvedScript = script;
+  if (review.requiresRevision || review.requiresHumanReview) {
+    await recordStep('claim_review', 'waiting');
+    await waitForReviewDecision();
+    approvedScript = await activities.reviseScript(script, review);
+    // Re-run extraction, retrieval, and assessment for approvedScript before continuing.
+  }
+
   const [media, voice] = await Promise.all([
-    withStep('media_collection', () => activities.collectMedia(script)),
-    withStep('voice_generation', () => activities.generateVoice(script)),
+    withStep('media_collection', () => activities.collectMedia(approvedScript)),
+    withStep('voice_generation', () => activities.generateVoice(approvedScript)),
   ]);
 
   const timeline = await withStep('video_composition', () =>
-    activities.composeTimeline(script, media, voice)
+    activities.composeTimeline(approvedScript, media, voice)
   );
 
   const video = await withStep('rendering', () =>
@@ -103,7 +132,7 @@ export async function VideoGenerationWorkflow(input: JobInput): Promise<JobResul
 }
 ```
 
-Media collection and voice generation are independent of each other (both only depend on the script) and run in parallel — this alone can meaningfully cut end-to-end latency, and is a natural fit once the pipeline is modeled as a workflow rather than a linear queue chain.
+Media collection and voice generation are independent of each other (both depend on the approved script) and run in parallel. They must not start until the review gate allows the script to proceed. A `supported` outcome may proceed under policy; `contradicted`, `unsupported`, and `insufficient/conflicting` outcomes remain visible and follow the configured revision or human-review path.
 
 ### 3.4 Worker Services
 
@@ -112,6 +141,9 @@ Each activity type is deployed as its own worker pool so scaling and resource al
 | Worker | Resource Profile | Scaling Trigger | Notes |
 |---|---|---|---|
 | Planning / Script | Low CPU, network-bound (LLM call) | Queue depth | Calls Anthropic API with structured/tool-use output for a typed script object |
+| Claim Extraction | Low CPU, network-bound (LLM call) | Queue depth | Extracts checkable claims and script locations; stores extraction metadata and coverage limitations |
+| Evidence Retrieval | Low CPU, network-bound | Queue depth + provider quota | Searches permitted sources, stores URLs/metadata and minimal excerpts, and records retrieval failures as incomplete checks |
+| Claim Assessment / Review | Low CPU, network-bound (LLM call) | Queue depth | Assesses claims against supplied evidence, assigns the four defined outcomes, and applies the review policy without presenting the model judgment as proof |
 | Media Collection | Low CPU, network-bound | Queue depth | Queries stock APIs first; falls back to generative image API only on no-match, per licensing policy |
 | Voice Generation | Low CPU, network-bound | Queue depth | Calls TTS provider; stores resulting audio in object storage, writes an `Artifact` row |
 | Composition | Medium CPU | Queue depth | Runs Remotion in "calculate metadata" / timeline-assembly mode — produces a render spec, not yet a final video file |
@@ -144,7 +176,13 @@ sequenceDiagram
     API-->>FE: SSE: planning started
     W->>DB: insert Artifact (script)
     W->>DB: update JobStep (planning, completed)
-    Note over T,W: repeat per stage: media, voice, compose, render, publish
+    T->>W: dispatch claim extraction, evidence retrieval, and assessment
+    W->>DB: insert Claims, Evidence Sources, and Assessments
+    W-->>API: pub/sub fact-check progress and review state
+    API-->>FE: SSE: claim outcomes + review required
+    FE->>API: review decision or revised script
+    API->>T: signal review / recheck workflow
+    Note over T,W: only after the review gate: media, voice, compose, render, publish
     W->>S3: store final video
     W->>DB: insert Artifact (final_video), Publish Record
     T-->>API: workflow completed
@@ -172,8 +210,10 @@ jobs
   tone              text
   target_platforms  text[]        -- e.g. {youtube, tiktok}
   constraints       jsonb         -- duration, style, cta, language
-  status            text not null -- queued|planning|script_drafting|media_collection|
-                                   -- voice_generation|video_composition|uploading|completed|failed
+  status            text not null -- queued|planning|script_drafting|claim_extraction|
+                                   -- evidence_retrieval|claim_assessment|review_required|
+                                   -- media_collection|voice_generation|video_composition|
+                                   -- uploading|completed|failed
   workflow_id       text unique   -- Temporal workflow id, = 'job:' || id
   created_at        timestamptz default now()
   updated_at        timestamptz default now()
@@ -188,10 +228,55 @@ job_steps
   error_detail      jsonb
   retry_count       int default 0
 
+script_versions
+  id                uuid primary key
+  job_id            uuid references jobs(id)
+  version_number    int not null
+  content           jsonb not null
+  revision_reason   text
+  created_at        timestamptz default now()
+
+claims
+  id                uuid primary key
+  job_id            uuid references jobs(id)
+  script_version_id uuid references script_versions(id)
+  claim_text        text not null
+  location          jsonb not null       -- paragraph, sentence, or segment
+  claim_type        text
+  extraction_meta   jsonb
+  outcome           text not null         -- supported|contradicted|unsupported|
+                                         -- insufficient_or_conflicting
+  rationale         text
+  assessment_meta   jsonb                 -- model/provider version, assessment time
+  created_at        timestamptz default now()
+  updated_at        timestamptz default now()
+
+evidence_sources
+  id                uuid primary key
+  claim_id          uuid references claims(id)
+  url               text not null
+  title             text
+  publisher         text
+  published_at      timestamptz
+  retrieved_at      timestamptz not null
+  excerpt           text                  -- only where permitted by source terms
+  direction         text                  -- supports|contradicts|context
+  quality_notes     text
+  content_hash      text
+
+claim_reviews
+  id                uuid primary key
+  claim_id          uuid references claims(id)
+  decision           text not null         -- accept|revise|remove|request_review
+  reviewer_type     text not null          -- user|system
+  rationale         text
+  resulting_script_version_id uuid references script_versions(id)
+  created_at        timestamptz default now()
+
 artifacts
   id                uuid primary key
   job_id            uuid references jobs(id)
-  type              text not null  -- script|image|clip|voice|final_video
+  type              text not null  -- script|evidence_report|image|clip|voice|final_video
   uri               text not null  -- object storage key
   metadata          jsonb          -- duration, resolution, voice provider, etc.
   created_at        timestamptz default now()
@@ -216,7 +301,7 @@ publish_records
   response_summary  jsonb
 ```
 
-Indexes worth adding immediately: `jobs(user_id, created_at desc)` for history browsing, `job_steps(job_id)`, `artifacts(job_id)`.
+Indexes worth adding immediately: `jobs(user_id, created_at desc)` for history browsing, `job_steps(job_id)`, `claims(job_id, script_version_id)`, `evidence_sources(claim_id)`, `claim_reviews(claim_id, created_at desc)`, and `artifacts(job_id)`.
 
 ## 6. API Contracts (Key Endpoints)
 
@@ -242,9 +327,19 @@ data: {"step":"planning","status":"started","timestamp":"..."}
 event: step_update
 data: {"step":"planning","status":"completed","timestamp":"..."}
 
+event: fact_check_update
+data: {"step":"claim_assessment","status":"review_required","claimCount":4,"flaggedCount":2,"timestamp":"..."}
+
 event: job_completed
 data: {"jobId":"b1e2...","status":"completed","artifacts":[...]}
 ```
+
+### Claims and Evidence
+- `GET /jobs/:id/claims` — returns claims for the latest or requested script version, including outcome and review state.
+- `GET /claims/:id` — returns the claim, script location, assessment rationale, and audit metadata.
+- `GET /claims/:id/evidence` — returns source metadata, excerpts where permitted, retrieval timestamps, and evidence direction.
+- `POST /claims/:id/review` — records `accept`, `revise`, `remove`, or `request_review`; user decisions are immutable audit records.
+- `POST /jobs/:id/recheck` — creates a new assessment set after a script revision without overwriting prior results.
 
 ### `POST /jobs/:id/retry`
 Re-signals the existing Temporal workflow to retry from the failed activity rather than starting a new workflow — preserves already-completed artifacts (script, media, voice) instead of regenerating everything.
@@ -259,7 +354,9 @@ Re-signals the existing Temporal workflow to retry from the failed activity rath
 ## 7. Idempotency and Retry Strategy
 
 - **Workflow-level idempotency**: Temporal workflow id = `job:{jobId}`. Starting a workflow with an id already in use returns the existing workflow handle instead of creating a duplicate — this makes `POST /jobs/:id/retry` safe to call multiple times.
-- **Activity-level retries**: each activity has a retry policy (initial interval, backoff coefficient, max attempts) tuned per activity — e.g., LLM calls retry aggressively on 429s, publish activities retry conservatively given platform rate limits.
+- **Activity-level retries**: each activity has a retry policy (initial interval, backoff coefficient, max attempts) tuned per activity — e.g., LLM calls retry aggressively on 429s, retrieval retries transient provider failures, and publish activities retry conservatively given platform rate limits.
+- **Fact-check failure semantics**: a retrieval timeout/provider error is an incomplete check, not an `unsupported` outcome. The workflow records the failure and follows the configured review policy; it never bypasses the review gate silently.
+- **Revision/recheck idempotency**: each script revision creates a new `script_versions` row and a new claim/evidence assessment set. Prior assessments and review decisions remain immutable audit history, while the latest version determines whether production may continue.
 - **Publish idempotency**: a deterministic `idempotency_key` (hash of `jobId + provider`) is passed to the upload activity and stored on the `publish_records` row before the network call is made, so a retried publish activity can check "did I already succeed?" before re-uploading and creating a duplicate video on the platform.
 
 ## 8. Storage Layout
@@ -268,6 +365,7 @@ Object storage (S3-compatible) organized by job for easy lifecycle management an
 
 ```
 /{userId}/{jobId}/script.json
+/{userId}/{jobId}/fact-check/{scriptVersionId}/report.json
 /{userId}/{jobId}/media/{assetId}.mp4|.jpg
 /{userId}/{jobId}/voice/narration.mp3
 /{userId}/{jobId}/render/final.mp4
@@ -291,7 +389,7 @@ Workers publish to a Redis pub/sub channel keyed by `job:{jobId}:events`. The AP
 }
 ```
 
-This same event is also durably written to `job_steps`, so a user who refreshes mid-job (missing live events) gets the same picture from a plain `GET /jobs/:id/steps` call — SSE is a convenience layer, not the source of truth.
+Fact-check events include claim counts and review transitions, while claim/evidence rows remain the source of truth for details. Events are also durably written to `job_steps`, so a user who refreshes mid-job (missing live events) gets the same picture from a plain `GET /jobs/:id/steps` and claims query — SSE is a convenience layer, not the source of truth.
 
 ## 10. Deployment Modes: Provider Abstraction and Local Configuration Menu
 
@@ -303,6 +401,12 @@ Every external dependency in this system — LLM, TTS, storage, auth, email, orc
 interface LLMProvider {
   generatePlan(input: JobInput): Promise<ContentPlan>;
   draftScript(plan: ContentPlan): Promise<Script>;
+  extractClaims(script: Script): Promise<ExtractedClaim[]>;
+  assessClaims(claims: ExtractedClaim[], evidence: EvidenceSource[]): Promise<ClaimAssessment[]>;
+}
+
+interface EvidenceProvider {
+  search(claim: ExtractedClaim): Promise<EvidenceSource[]>;
 }
 
 interface TTSProvider {
@@ -332,6 +436,7 @@ interface EmailProvider {
 | Interface | Paid Implementation | Free Implementation |
 |---|---|---|
 | `LLMProvider` | `AnthropicLLMProvider` (Claude via Anthropic API) | `OllamaLLMProvider` (self-hosted Llama 3.1/Mistral) or `GroqLLMProvider` (free tier, open models) |
+| `EvidenceProvider` | Search API or licensed data provider | Search provider with a usable free tier, or limited documented source retrieval |
 | `TTSProvider` | `ElevenLabsProvider` | `PiperTTSProvider` or `EdgeTTSProvider` |
 | `ImageGenProvider` | `ReplicateImageProvider` | `StableDiffusionLocalProvider` (ComfyUI on the free VM) or disabled — stock-only fallback |
 | `StorageProvider` | `S3StorageProvider` (AWS S3 / Cloudflare R2) | `MinioStorageProvider` (self-hosted, S3-compatible API, same interface) |
@@ -457,6 +562,7 @@ Everything except the frontend runs on a single free-tier VM (e.g., an Oracle Cl
 - All inter-service calls over TLS; API validates session tokens on every request via the active `AuthProvider` (Clerk in paid mode, self-hosted Auth.js in free mode).
 - OAuth tokens for YouTube/TikTok encrypted at rest using envelope encryption (KMS-managed data key in paid mode; a locally-managed symmetric key in free mode, since there's no managed KMS on a bare VM) — decrypted only inside the publish worker's process memory, never logged.
 - Per-user row-level isolation enforced at the query layer (every `jobs`/`artifacts` query scoped by `user_id` derived from the authenticated session, not from client input).
+- Apply the same authorization scope to claims, evidence sources, script versions, and review decisions; never trust a client-provided `job_id` or claim ownership.
 - Signed, short-TTL URLs for all storage reads/writes — no long-lived public buckets, whether the backing store is S3/R2 or self-hosted MinIO.
 - Content safety filter (moderation API call, or a self-hosted moderation model in free mode) runs as an activity between `composeTimeline` and `publishContent`, so generated content is checked before it ever reaches a platform's public API.
 
